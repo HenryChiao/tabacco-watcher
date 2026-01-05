@@ -4,250 +4,324 @@ import json
 import os
 import time
 import datetime
+from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
-from config import HEADERS, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from fake_useragent import UserAgent
 
-# 状态记录文件路径
+# 引入新模块
+from config import get_site_config, ADMIN_USER_ID, TELEGRAM_CHAT_ID
+from notifier import TelegramNotifier
+
+# 文件路径
 STATUS_FILE = "stock_status.json"
+PRODUCTS_FILE = "products.json"
 
 class TobaccoWatcher:
-    def __init__(self, config_list):
-        self.watch_list = config_list
-        self.stock_history = self.load_history()
-        self.telegram_offset = 0  # 用于记录 Telegram 消息读取位置
+    def __init__(self):
+        # 初始化基础组件
+        self.session = self._init_session()
+        self.ua = UserAgent()
         
-        # 初始化网络会话，配置重试策略
-        self.session = requests.Session()
-        retries = Retry(
-            total=3,                # 最大重试次数
-            backoff_factor=1,       # 重试间隔 (1s, 2s, 4s...)
-            status_forcelist=[500, 502, 503, 504] # 针对这些状态码进行重试
-        )
-        self.session.mount('https://', HTTPAdapter(max_retries=retries))
-        self.session.headers.update(HEADERS)
+        # 初始化通知器
+        self.notifier = TelegramNotifier(self.session)
+        
+        # 加载数据
+        self.watch_list = self._load_products()
+        self.stock_history = self._load_history()
+        
+        # 运行时状态
+        self.start_time = datetime.datetime.now()
+        self.last_scan_time = None
+        self.consecutive_errors = 0
+        self.error_alert_sent = False
+        self.first_run = True
+        
+        # 看板状态
+        self.dashboard_message_ids = self.stock_history.get('_dashboard_ids', [])
+        self.alert_messages = self.stock_history.get('_alert_messages', {})
 
-    def load_history(self):
-        """加载历史库存状态"""
+    def _init_session(self):
+        s = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        s.mount('https://', HTTPAdapter(max_retries=retries))
+        return s
+
+    def _load_products(self):
+        if os.path.exists(PRODUCTS_FILE):
+            try:
+                with open(PRODUCTS_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except: pass
+        return []
+
+    def _load_history(self):
         if os.path.exists(STATUS_FILE):
             try:
                 with open(STATUS_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    # 简单的兼容性检查：如果旧数据是 bool 类型，重置它
-                    if data and isinstance(list(data.values())[0], bool):
-                        print("检测到旧版数据格式，将自动升级...")
-                        return {}
-                    return data
-            except:
-                return {}
+                    return json.load(f)
+            except: pass
         return {}
 
     def save_history(self):
-        """保存当前库存状态到文件"""
         try:
+            self.stock_history['_dashboard_ids'] = self.dashboard_message_ids
+            self.stock_history['_alert_messages'] = self.alert_messages
             with open(STATUS_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.stock_history, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"保存状态失败: {e}")
 
     def fetch_page(self, url):
-        """获取网页源代码 (带重试)"""
         try:
-            # print(f"正在请求: {url}") # 减少刷屏，仅调试用
-            # 使用配置好重试策略的 session 发送请求
-            response = self.session.get(url, timeout=20)
-            response.raise_for_status()
-            return response.text
+            timestamp = int(time.time() * 1000)
+            target = f"{url}{'&' if '?' in url else '?'} _t={timestamp}"
+            headers = {"User-Agent": self.ua.random}
+            
+            resp = self.session.get(target, headers=headers, timeout=20)
+            resp.raise_for_status()
+            return resp.text
         except Exception as e:
             print(f"❌ 请求失败 [{url}]: {e}")
             return None
 
     def check_stock(self, card_soup, selectors):
-        """
-        检查单个商品的库存状态
-        返回: (商品名称, 是否售罄)
-        """
-        # 1. 获取商品名称
+        """解析单卡片库存"""
+        # 1. 获取名称
         name_elem = card_soup.select_one(selectors['product_name'])
-        if not name_elem:
-            return None, True
+        if not name_elem: return None, True
         
-        # 获取文本并清洗：去除可能存在的HTML标签（如 <tc>）和多余空白
         raw_name = name_elem.get_text(strip=True)
-        # 使用正则彻底移除任何 <...> 格式的内容，以防万一
-        product_name = re.sub(r'<[^>]+>', '', raw_name).strip()
+        name = re.sub(r'<[^>]+>', '', raw_name).strip()
 
-        # 2. 获取库存状态
-        # 极简方案：直接检查购买按钮是否被禁用 (disabled)
+        # 2. 获取按钮状态
         button = card_soup.select_one(selectors['status_button'])
+        if not button: return None, None # 无效区域
+
+        is_sold_out = False
         
-        if not button:
-            # 没有购买按钮 = 无效卡片，跳过
-            return None, None
+        # 优先判定: 如果配置了 sold_out_text，则优先使用文字匹配逻辑
+        # (这对于华盛这种按钮始终可用，只变文字的网站非常重要)
+        if selectors.get('sold_out_text'):
+            target_text = selectors['sold_out_text'].upper()
+            
+            # 清理隐藏文本，获取真实可见文字
+            import copy
+            btn_clone = copy.copy(button)
+            for hidden in btn_clone.select('.hidden'): hidden.decompose()
+            btn_text = btn_clone.get_text(strip=True).upper()
+            
+            if target_text in btn_text:
+                is_sold_out = True
+        
+        # 次要判定: 如果没配置特定文字，或文字没命中，检查通用属性
+        else:
+            # 1. 检查 disabled 属性
+            if button.has_attr('disabled'): is_sold_out = True
+            
+            # 2. 检查 class 是否包含 sold-out
+            if not is_sold_out:
+                classes = button.get('class', [])
+                if any('sold-out' in c for c in classes): is_sold_out = True
+            
+            # 3. 检查通用售罄关键词 (仅在未配置特定文字时启用)
+            if not is_sold_out:
+                default_keywords = ["售罄", "SOLD OUT", "SOLDOUT", "OUT OF STOCK"]
+                btn_text = button.get_text(strip=True).upper()
+                if any(kw in btn_text for kw in default_keywords):
+                    is_sold_out = True
 
-        # 只要按钮有 disabled 属性，就视为售罄；否则视为有货。
-        is_sold_out = button.has_attr('disabled')
-
-        return product_name, is_sold_out
+        return name, is_sold_out
 
     def run(self):
-        """执行监控任务"""
+        """主执行逻辑"""
         print("-" * 50)
+        self.last_scan_time = datetime.datetime.now()
+        new_restocks = []
+        has_error = False
+        status_changed = False
         
-        results = []
-
         for item in self.watch_list:
-            html = self.fetch_page(item['url'])
+            url = item['url']
+            # 从新配置系统获取模板
+            site_name, selectors = get_site_config(url)
+            
+            html = self.fetch_page(url)
             if not html:
+                has_error = True
                 continue
 
             soup = BeautifulSoup(html, 'html.parser')
-            cards = soup.select(item['selectors']['product_card'])
-            
-            # 简洁输出找到的数量
-            # print(f"[{item['name']}] 扫描到 {len(cards)} 个商品...")
+            cards = soup.select(selectors['product_card'])
 
             for card in cards:
-                # check_stock 现在可能返回 (None, None) 表示无效卡片
-                result = self.check_stock(card, item['selectors'])
-                if not result or result[0] is None:
-                    continue
+                result = self.check_stock(card, selectors)
+                if not result or result[0] is None: continue
                 
                 name, is_sold_out = result
+                product_id = f"{name}_{url}" # 唯一标识
                 
-                if name:
-                    # 生成唯一ID (防止不同页面有同名商品)
-                    product_id = f"{name}_{item['url']}"
-                    
-                    # 检查历史状态
-                    # 兼容旧代码：如果历史记录不存在，或者格式不对，默认为售罄
-                    last_record = self.stock_history.get(product_id)
-                    if isinstance(last_record, dict):
-                        was_sold_out = last_record.get('is_sold_out', True)
-                    else:
-                        was_sold_out = True
-                    
-                    # 核心通知逻辑：只有当 [上次没货] 且 [现在有货] 时，才通知
-                    should_notify = was_sold_out and (not is_sold_out)
-                    
-                    # 更新历史记录 (存入更详细的信息以便Bot查询)
-                    self.stock_history[product_id] = {
-                        'name': name,
-                        'url': item['url'],
-                        'is_sold_out': is_sold_out,
-                        'updated_at': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }
+                # 状态对比
+                last_record = self.stock_history.get(product_id, {})
+                was_sold_out = last_record.get('is_sold_out', True)
+                
+                if is_sold_out != was_sold_out:
+                    status_changed = True
+                
+                # 更新记录
+                self.stock_history[product_id] = {
+                    'name': name, 'url': url, 'is_sold_out': is_sold_out,
+                    'site_name': site_name, # 记录中文名方便分组
+                    'updated_at': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
 
-                    # 简洁的单行输出
-                    if is_sold_out:
-                        print(f"❌ [售罄] {name}")
-                    else:
-                        # 如果触发了通知条件，加上一个铃铛图标 🔔
-                        if should_notify:
-                            print(f"🔔 [新补货!] {name} (已触发通知)")
-                            self.send_notification(name, item['url'])
-                        else:
-                            print(f"✅ [有货] {name} (已通知过)")
+                # 补货提醒
+                if was_sold_out and not is_sold_out:
+                    print(f"🔔 [补货] {name}")
+                    new_restocks.append(self.stock_history[product_id])
+                
+                # 刚售罄 -> 删旧通知
+                if not was_sold_out and is_sold_out:
+                    print(f"❌ [售罄] {name}")
+                    self._delete_alert(product_id)
 
-        # 扫描完一轮后，保存状态
+        # 刷新看板
+        if status_changed or self.first_run or not self.dashboard_message_ids:
+            self._refresh_dashboard()
+            self.first_run = False
+            
+        # 发送新补货通知
+        if new_restocks:
+            self._send_restock_alerts(new_restocks)
+
+        # 统计摘要日志 (避免刷屏)
+        total_items = len(self.stock_history) - 2 # 减去 _dashboard_ids 和 _alert_messages
+        in_stock_count = sum(1 for v in self.stock_history.values() if isinstance(v, dict) and not v.get('is_sold_out', True))
+        
+        # 只打印简报
+        print(f"📊 本轮统计: 总计 {total_items} 商品 | ✅ 有货: {in_stock_count} | ❌ 售罄: {total_items - in_stock_count}")
+
         self.save_history()
+        self._handle_errors(has_error)
         print("-" * 50)
-        return results
 
-    def send_notification(self, product_name, url):
-        """发送通知"""
-        print(f"\n>>> 发送通知: {product_name} 现在可购买! <<<\n")
+    def _refresh_dashboard(self):
+        """刷新看板消息"""
+        pages = self._generate_dashboard_content()
         
-        # 构造消息内容
-        message = (
-            f"🚨 <b>补货提醒!</b>\n\n"
-            f"📦 <b>{product_name}</b>\n"
-            f"✅ 现在有货!\n\n"
-            f"🔗 <a href='{url}'>点击购买</a>"
-        )
-        
-        self.send_telegram_message(message)
-
-    def send_telegram_message(self, text, chat_id=None):
-        """推送到 Telegram"""
-        if not TELEGRAM_BOT_TOKEN:
-            return
-
-        # 如果未指定 chat_id，使用配置文件的默认 ID
-        target_chat_id = chat_id if chat_id else TELEGRAM_CHAT_ID
-        if not target_chat_id:
-            return
-
-        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": target_chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        
-        try:
-            resp = self.session.post(api_url, json=payload, timeout=10)
-            resp.raise_for_status()
-            # print("📩 Telegram 通知已发送")
-        except Exception as e:
-            print(f"⚠️ Telegram 推送失败: {e}")
-
-    def get_stock_report(self):
-        """生成当前库存报告"""
-        if not self.stock_history:
-            return "📭 暂无库存数据，请等待第一次扫描完成。"
-        
-        in_stock_items = []
-        
-        for pid, info in self.stock_history.items():
-            if not info.get('is_sold_out', True):
-                in_stock_items.append(info)
-        
-        if not in_stock_items:
-            return "❌ <b>当前所有监控商品均已售罄。</b>"
+        # 多退
+        while len(self.dashboard_message_ids) > len(pages):
+            old_id = self.dashboard_message_ids.pop()
+            self.notifier.delete_message(old_id)
             
-        report = f"📊 <b>当前库存清单 ({len(in_stock_items)})</b>\n\n"
-        for item in in_stock_items:
-            report += f"✅ <b>{item['name']}</b>\n🔗 <a href='{item['url']}'>点击购买</a>\n\n"
-            
-        report += f"<i>最后更新: {datetime.datetime.now().strftime('%H:%M')}</i>"
-        return report
+        # 少补 & 更新
+        for i, text in enumerate(pages):
+            if i < len(self.dashboard_message_ids):
+                msg_id = self.dashboard_message_ids[i]
+                if not self.notifier.edit_message(msg_id, text):
+                    # 编辑失败则重发
+                    resp = self.notifier.send_message(text)
+                    if resp: self.dashboard_message_ids[i] = resp['result']['message_id']
+            else:
+                resp = self.notifier.send_message(text)
+                if resp: self.dashboard_message_ids.append(resp['result']['message_id'])
 
-    def poll_telegram_commands(self):
-        """监听 Telegram 指令 (运行在独立线程)"""
-        if not TELEGRAM_BOT_TOKEN:
-            print("⚠️ 未配置 Bot Token，指令监听未启动")
-            return
-
-        print("🤖 Telegram 机器人监听中 (发送 /stock 查询库存)...")
-        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    def _generate_dashboard_content(self):
+        """生成看板内容 (按站点分组 + 分片)"""
+        if not self.stock_history: return ["⏳ 初始化中..."]
         
-        while True:
-            try:
-                # 使用 long polling (timeout=60)
-                params = {"offset": self.telegram_offset + 1, "timeout": 60}
-                resp = self.session.get(api_url, params=params, timeout=70)
+        # 过滤
+        items = [v for k, v in self.stock_history.items() if not k.startswith('_')]
+        if not items: return ["📭 暂无监控"]
+        
+        # 分组 (按 site_name)
+        grouped = {}
+        for item in items:
+            site = item.get('site_name', '未知')
+            if site not in grouped: grouped[site] = []
+            grouped[site].append(item)
+            
+        all_msgs = []
+        MAX_LEN = 3800
+        
+        for site, products in grouped.items():
+            products.sort(key=lambda x: x['is_sold_out'])
+            
+            site_msgs = []
+            header = f"🌐 <b>{site}</b> (更新: {datetime.datetime.now().strftime('%H:%M:%S')})\n"
+            current_msg = header + "<blockquote expandable>"
+            quote_open = True
+            
+            for p in products:
+                # 仅保留商品名，去掉了超链接 <a> 标签
+                # 示例: ✅ 商品名 (有货) / ❌ <s>商品名</s> (售罄)
+                # 注意：为了让 Markdown/HTML 解析正常，售罄时仍保留 <s> 删除线
+                product_name = p['name']
+                line = f"{'✅' if not p['is_sold_out'] else '❌ <s>'} {product_name}{'</s>' if p['is_sold_out'] else ''}\n"
                 
-                if resp.status_code == 200:
-                    result = resp.json().get("result", [])
-                    for update in result:
-                        self.telegram_offset = update["update_id"]
-                        
-                        # 处理消息
-                        if "message" in update and "text" in update["message"]:
-                            text = update["message"]["text"].strip()
-                            chat_id = update["message"]["chat"]["id"]
-                            
-                            if text == "/stock":
-                                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 📩 收到 /stock 指令")
-                                report = self.get_stock_report()
-                                self.send_telegram_message(report, chat_id)
+                if len(current_msg) + len(line) + 20 > MAX_LEN:
+                    if quote_open: current_msg += "</blockquote>"
+                    site_msgs.append(current_msg)
+                    
+                    current_msg = f"🌐 <b>{site} (续)</b>\n<blockquote expandable>"
+                    quote_open = True
+                
+                current_msg += line
+                
+            if quote_open: current_msg += "</blockquote>"
+            site_msgs.append(current_msg)
+            all_msgs.extend(site_msgs)
             
-            except Exception as e:
-                print(f"⚠️ Telegram 监听异常 (自动重试): {e}")
-                time.sleep(5)
-            
-            # 避免死循环跑太快
-            time.sleep(1)
+        return all_msgs
+
+    def _send_restock_alerts(self, items):
+        for item in items:
+            text = (
+                f"🚨 <b>补货提醒!</b>\n\n"
+                f"🏪 <b>{item['site_name']}</b>\n"
+                f"📦 <b>{item['name']}</b>\n"
+                f"🔗 <a href='{item['url']}'>点击购买</a>"
+            )
+            resp = self.notifier.send_message(text)
+            if resp:
+                pid = f"{item['name']}_{item['url']}"
+                self.alert_messages[pid] = resp['result']['message_id']
+
+    def _delete_alert(self, pid):
+        if pid in self.alert_messages:
+            self.notifier.delete_message(self.alert_messages[pid])
+            del self.alert_messages[pid]
+
+    def _handle_errors(self, has_error):
+        if has_error:
+            self.consecutive_errors += 1
+            print(f"⚠️ 抓取错误 ({self.consecutive_errors}次)")
+            if self.consecutive_errors >= 5 and not self.error_alert_sent:
+                self.notifier.send_message(f"🚨 <b>报警</b>: 连续 5 次抓取失败，请检查服务器。", chat_id=ADMIN_USER_ID)
+                self.error_alert_sent = True
+        else:
+            if self.consecutive_errors > 0:
+                print("✅ 错误恢复")
+                if self.error_alert_sent:
+                    self.notifier.send_message("✅ <b>恢复</b>: 抓取已恢复正常。", chat_id=ADMIN_USER_ID)
+            self.consecutive_errors = 0
+            self.error_alert_sent = False
+
+    def handle_command(self, text, chat_id):
+        """处理 Telegram 指令"""
+        if text == "/stock" or text.startswith("/stock@"):
+            print(f"📩 收到 /stock")
+            for page in self._generate_dashboard_content():
+                self.notifier.send_message(page, chat_id)
+        elif text == "/status" or text.startswith("/status@"):
+            uptime = str(datetime.datetime.now() - self.start_time).split('.')[0]
+            msg = (f"🤖 <b>状态报告</b>\n⏱ 运行时长: {uptime}\n"
+                   f"📉 错误计数: {self.consecutive_errors}")
+            self.notifier.send_message(msg, chat_id)
+
+    def start_bot(self):
+        """启动指令监听线程"""
+        import threading
+        t = threading.Thread(target=self.notifier.poll_commands, args=(self.handle_command,), daemon=True)
+        t.start()
