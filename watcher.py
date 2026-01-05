@@ -28,6 +28,7 @@ class TobaccoWatcher:
         self.notifier = TelegramNotifier(self.session)
         
         # 加载数据
+        self.history_file_exists = os.path.exists(STATUS_FILE) # 标记是否存在历史文件
         self.watch_list = self._load_products()
         self.stock_history = self._load_history()
         
@@ -178,8 +179,12 @@ class TobaccoWatcher:
 
                 # 补货提醒
                 if was_sold_out and not is_sold_out:
-                    print(f"🔔 [补货] {name}")
-                    new_restocks.append(self.stock_history[product_id])
+                    # 优化：如果是首次运行且没有历史文件，说明是初始化，不发送补货通知，避免炸群
+                    if self.first_run and not self.history_file_exists:
+                        print(f"✅ [初始化] 发现有货: {name} (首次运行不通知)")
+                    else:
+                        print(f"🔔 [补货] {name}")
+                        new_restocks.append(self.stock_history[product_id])
                 
                 # 刚售罄 -> 删旧通知
                 if not was_sold_out and is_sold_out:
@@ -248,8 +253,17 @@ class TobaccoWatcher:
         for site, products in grouped.items():
             products.sort(key=lambda x: x['is_sold_out'])
             
+            # 计算当前站点的库存统计
+            total_count = len(products)
+            in_stock = sum(1 for p in products if not p['is_sold_out'])
+            out_stock = total_count - in_stock
+            
             site_msgs = []
-            header = f"🌐 <b>{site}</b> (更新: {datetime.datetime.now().strftime('%H:%M:%S')})\n"
+            # 标题带上统计数据 (例如: 20有货 / 80售罄)
+            header = (
+                f"🌐 <b>{site}</b> (更新: {datetime.datetime.now().strftime('%H:%M:%S')})\n"
+                f"📊 <b>统计:</b> ✅ {in_stock} 有货 | ❌ {out_stock} 售罄\n"
+            )
             current_msg = header + "<blockquote expandable>"
             quote_open = True
             
