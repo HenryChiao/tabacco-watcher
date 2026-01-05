@@ -43,6 +43,10 @@ SITE_CONFIGS = {
     "huashengyansi.cv": {
         "name": "华盛",
         "template": TEMPLATE_HUASHENG
+    },
+    "pipeuncle.com": {
+        "name": "茄营",
+        "template": TEMPLATE_DEFAULT  # API 模式不使用 CSS 选择器模板
     }
 }
 

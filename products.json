@@ -150,5 +150,25 @@
     {
         "name": "华盛-史丹利",
         "url": "https://www.huashengyansi.cv/product-category/%e6%89%8b%e5%8d%b7/%e5%8f%b2%e4%b8%b9%e5%88%a9/"
+    },
+    {
+        "name": "茄营-优惠套装",
+        "url": "https://www.pipeuncle.com/api/goods/category-list?categoryId=146&pageNo=1&pageSize=10&activity=default"
+    },
+    {
+        "name": "茄营-金色维吉尼亚",
+        "url": "https://www.pipeuncle.com/api/goods/category-list?categoryId=80&pageNo=1&pageSize=10&activity=default"
+    },
+    {
+        "name": "茄营-喇叭手",
+        "url": "https://www.pipeuncle.com/api/goods/category-list?categoryId=72&pageNo=1&pageSize=10&activity=default"
+    },
+    {
+        "name": "茄营-小马牌克鲁斯",
+        "url": "https://www.pipeuncle.com/api/goods/category-list?categoryId=162&pageNo=1&pageSize=10&activity=default"
+    },
+    {
+        "name": "茄营-黑船长",
+        "url": "https://www.pipeuncle.com/api/goods/category-list?categoryId=119&pageNo=1&pageSize=10&activity=default"
     }
 ]
