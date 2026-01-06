@@ -159,11 +159,15 @@ class TobaccoWatcher:
         返回: (should_notify, status_changed, record)
         """
         with self.lock:
+            # 检查是否为新商品
+            is_new_product = product_id not in self.stock_history
+            
             last_record = self.stock_history.get(product_id, {})
             was_sold_out = last_record.get('is_sold_out', True)
             in_stock_counter = last_record.get('in_stock_counter', 0)
             
-            status_changed = (is_sold_out != was_sold_out)
+            # 状态改变 或 新商品加入，都视为变更，需要刷新看板
+            status_changed = (is_sold_out != was_sold_out) or is_new_product
             should_notify = False
             
             # --- 状态核心逻辑 ---
@@ -409,6 +413,9 @@ class TobaccoWatcher:
     def run(self):
         """核心调度逻辑 (全站同步并发)"""
         print("-" * 50)
+        # [热更新] 每一轮都重新加载商品列表，无需重启程序
+        self.watch_list = self._load_products()
+        
         self.last_scan_time = datetime.datetime.now()
         
         # 1. 对监控列表按域名进行分组
