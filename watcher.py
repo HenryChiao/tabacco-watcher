@@ -37,7 +37,10 @@ class TobaccoWatcher:
         self.watch_list = self._load_products()
         self.stock_history = self._load_history()
         
-        # 3. 初始化运行时状态
+        # 3. 清理僵尸数据 (逻辑内存泄漏修复)
+        self._cleanup_stale_data()
+
+        # 4. 初始化运行时状态
         self.start_time = datetime.datetime.now()
         self.last_scan_time = None
         self.consecutive_errors = 0
@@ -70,6 +73,37 @@ class TobaccoWatcher:
             except: pass
         return {}
 
+    def _cleanup_stale_data(self):
+        """清理不再监控的商品历史数据 (防止无限膨胀)"""
+        if not self.watch_list: return
+        
+        # 1. 获取当前所有有效的监控 URL 集合
+        valid_urls = set(item['url'] for item in self.watch_list)
+        
+        # 2. 找出需要删除的 key
+        keys_to_remove = []
+        for pid, record in self.stock_history.items():
+            # 跳过元数据 (以 _ 开头)
+            if pid.startswith('_'): continue
+            
+            # 检查记录中的 url 是否仍在监控列表中
+            # 注意：record 必须包含 url 字段
+            record_url = record.get('url')
+            if record_url and record_url not in valid_urls:
+                keys_to_remove.append(pid)
+                
+        # 3. 执行删除
+        if keys_to_remove:
+            print(f"🧹 [清理] 移除 {len(keys_to_remove)} 个不再监控的商品历史记录")
+            for pid in keys_to_remove:
+                del self.stock_history[pid]
+                # 同时尝试清理可能残留的报警 ID
+                if pid in self.alert_messages:
+                    del self.alert_messages[pid]
+            
+            # 立即保存一次，更新文件
+            self.save_history()
+
     def save_history(self):
         with self.lock:
             try:
@@ -84,6 +118,7 @@ class TobaccoWatcher:
         try:
             timestamp = int(time.time() * 1000)
             target = f"{url}{'&' if '?' in url else '?'} _t={timestamp}"
+            
             headers = {"User-Agent": self.ua.random}
             
             resp = self.session.get(target, headers=headers, timeout=10)
