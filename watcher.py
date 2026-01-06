@@ -278,8 +278,16 @@ class TobaccoWatcher:
                     for product in data.get('lists', []):
                         name = product.get('name', '未知商品')
                         has_stock = product.get('inventoryStatus', False)
-                        # API模式下所有商品共用同一个 web_url (列表页)
-                        yield name, web_url, not has_stock
+                        
+                        # [优化] 尝试构建商品详情页链接，实现跨分类去重
+                        # 如果有 ID，则生成唯一详情页链接；否则回退到分类页链接
+                        pid = product.get('id')
+                        if pid:
+                            product_url = f"https://www.pipeuncle.com/detail/goods?id={pid}"
+                        else:
+                            product_url = web_url
+                            
+                        yield name, product_url, not has_stock
                 
                 local_restocks, local_changed = self._process_product_batch(site_name, product_generator())
                                 
