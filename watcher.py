@@ -5,7 +5,8 @@ import os
 import time
 import random
 import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from urllib.parse import urlparse, parse_qs
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -29,6 +30,7 @@ class TobaccoWatcher:
         self.session = self._init_session()
         self.ua = UserAgent()
         self.notifier = TelegramNotifier(self.session)
+        self.lock = threading.Lock() # 线程安全锁
         
         # 2. 加载持久化数据
         self.history_file_exists = os.path.exists(STATUS_FILE)
@@ -69,13 +71,14 @@ class TobaccoWatcher:
         return {}
 
     def save_history(self):
-        try:
-            self.stock_history['_dashboard_ids'] = self.dashboard_message_ids
-            self.stock_history['_alert_messages'] = self.alert_messages
-            with open(STATUS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.stock_history, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"保存状态失败: {e}")
+        with self.lock:
+            try:
+                self.stock_history['_dashboard_ids'] = self.dashboard_message_ids
+                self.stock_history['_alert_messages'] = self.alert_messages
+                with open(STATUS_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(self.stock_history, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"保存状态失败: {e}")
 
     def fetch_page(self, url):
         try:
@@ -83,7 +86,7 @@ class TobaccoWatcher:
             target = f"{url}{'&' if '?' in url else '?'} _t={timestamp}"
             headers = {"User-Agent": self.ua.random}
             
-            resp = self.session.get(target, headers=headers, timeout=20)
+            resp = self.session.get(target, headers=headers, timeout=10)
             resp.raise_for_status()
             return resp.text
         except Exception as e:
@@ -102,14 +105,104 @@ class TobaccoWatcher:
             print(f"解密失败: {e}")
             return None
 
-    def _scan_api_pipeuncle(self, item):
-        """处理茄营 (PipeUncle) API 请求与解密"""
-        time.sleep(random.uniform(1, 3))
-        api_url = item['url']
-        site_name = "茄营"
+    def _get_product_id(self, name, url):
+        """统一生成商品唯一 ID"""
+        return f"{name}_{url}"
+
+    def _delete_alert(self, pid):
+        # 注意：此处不再加锁，由调用方保证或无所谓（Telegram操作本身是线程安全的，dict操作需要注意）
+        # 为了安全，dict的操作还是应该在锁内，或者使用 self.lock
+        # 但 _delete_alert 通常在 _handle_product_update 内部调用，那里已经有锁了
+        # 为了防止死锁，这里不加锁，假设调用方已处理好逻辑
+        if pid in self.alert_messages:
+            self.notifier.delete_message(self.alert_messages[pid])
+            del self.alert_messages[pid]
+
+    def _handle_product_update(self, product_id, name, url, site_name, is_sold_out):
+        """
+        统一处理商品状态更新、历史记录、计数器和通知逻辑
+        返回: (should_notify, status_changed, record)
+        """
+        with self.lock:
+            last_record = self.stock_history.get(product_id, {})
+            was_sold_out = last_record.get('is_sold_out', True)
+            in_stock_counter = last_record.get('in_stock_counter', 0)
+            
+            status_changed = (is_sold_out != was_sold_out)
+            should_notify = False
+            
+            # --- 状态核心逻辑 ---
+            if is_sold_out:
+                # 情况1: 售罄
+                in_stock_counter = 0 # 重置计数
+                if not was_sold_out:
+                    print(f"❌ [售罄] {name}")
+                    self._delete_alert(product_id)
+            else:
+                # 情况2: 有货
+                if was_sold_out:
+                    # 刚补货
+                    in_stock_counter = 0 # 重置计数
+                    if self.first_run and not self.history_file_exists:
+                        print(f"✅ [初始化] 发现有货: {name} (静默)")
+                    else:
+                        print(f"🔔 [补货] {name}")
+                        should_notify = True
+                else:
+                    # 持续有货
+                    in_stock_counter += 1
+                    # 60次检查都有货，则删除通知
+                    if in_stock_counter >= 60:
+                        # 仅在刚满60次时执行一次删除，避免重复调用 API
+                        if in_stock_counter == 60:
+                            print(f"🗑️ [超时] {name} 持续有货 {in_stock_counter} 次，自动移除通知")
+                            self._delete_alert(product_id)
+            
+            # 更新记录
+            record = {
+                'name': name,
+                'url': url,
+                'is_sold_out': is_sold_out,
+                'site_name': site_name,
+                'updated_at': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'in_stock_counter': in_stock_counter
+            }
+            self.stock_history[product_id] = record
+            
+            return should_notify, status_changed, record
+
+    def _process_product_batch(self, site_name, products_iter):
+        """
+        统一处理一批商品数据的状态更新循环
+        :param site_name: 站点名称
+        :param products_iter: 一个可迭代对象(list or generator)，每项为 (name, url, is_sold_out)
+        :return: (local_restocks, local_changed)
+        """
+        local_restocks = []
+        local_changed = False
         
-        # [URL转换] 尝试从 API URL 解析 categoryId 以构建前端可访问的 URL
-        # API: .../category-list?categoryId=146... -> Front: .../detail/class?id=146
+        for name, url, is_sold_out in products_iter:
+            product_id = self._get_product_id(name, url)
+            
+            # 调用统一处理逻辑
+            should_notify, changed, record = self._handle_product_update(
+                product_id, name, url, site_name, is_sold_out
+            )
+            
+            if changed: local_changed = True
+            if should_notify: local_restocks.append(record)
+            
+        return local_restocks, local_changed
+
+    def _scan_api_pipeuncle(self, item):
+        """[策略] 茄营 (PipeUncle) API 专用扫描逻辑"""
+        # API 模式不需要 sleep，并发控制由 run 方法的线程池处理
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        api_url = item['url']
+        site_name, _ = get_site_config(api_url) # 从 Config 获取统一名称，不再硬编码
+        
+        # [URL转换]
         try:
             parsed = urlparse(api_url)
             qs = parse_qs(parsed.query)
@@ -124,62 +217,32 @@ class TobaccoWatcher:
             "Referer": "https://www.pipeuncle.com/"
         }
         
+        local_restocks = []
+        local_changed = False
+        
         try:
-            resp = self.session.get(api_url, headers=headers, timeout=20)
+            resp = self.session.get(api_url, headers=headers, timeout=10)
             resp.raise_for_status()
             json_resp = resp.json()
             
-            local_restocks = []
-            local_changed = False
-            
-            # 验证响应结构: code=200 且存在 data 字段
             if 'code' in json_resp and json_resp['code'] == 200 and 'data' in json_resp:
                 encrypted_text = json_resp['data']
                 if not encrypted_text: return False, [], False
 
-                # 解密数据
                 decrypted_text = self._decrypt_pipeuncle_data(encrypted_text)
                 if not decrypted_text: return False, [], False
                 
-                # 解析商品列表
                 data = json.loads(decrypted_text)
-                for product in data.get('lists', []):
-                    name = product.get('name', '未知商品')
-                    has_stock = product.get('inventoryStatus', False) # true=有货
-                    is_sold_out = not has_stock
-                    
-                    # [去重策略] 使用 商品名+站点名 作为唯一 ID (移除 URL 依赖)
-                    # 目的: 避免不同链接包含相同商品时重复报警/重复展示
-                    # 注意: 这会覆盖旧的 ID 格式 (name_url)，如果需要兼容旧数据，旧数据会自动失效
-                    product_id = f"{name}_茄营"
-                    
-                    # --- 核心状态更新逻辑 (复用) ---
-                    last_record = self.stock_history.get(product_id, {})
-                    was_sold_out = last_record.get('is_sold_out', True)
-                    
-                    if is_sold_out != was_sold_out:
-                        local_changed = True
-                    
-                    self.stock_history[product_id] = {
-                        'name': name,
-                        'url': web_url, # 存储前端链接
-                        'is_sold_out': is_sold_out,
-                        'site_name': site_name,
-                        'updated_at': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                    
-                    # 补货通知
-                    if was_sold_out and not is_sold_out:
-                        if self.first_run and not self.history_file_exists:
-                            print(f"✅ [初始化] 发现有货: {name} (静默)")
-                        else:
-                            print(f"🔔 [补货] {name}")
-                            local_restocks.append(self.stock_history[product_id])
-                    
-                    # 售罄处理
-                    if not was_sold_out and is_sold_out:
-                        print(f"❌ [售罄] {name}")
-                        self._delete_alert(product_id)
+                
+                # 构造生成器供 batch 处理使用
+                def product_generator():
+                    for product in data.get('lists', []):
+                        name = product.get('name', '未知商品')
+                        has_stock = product.get('inventoryStatus', False)
+                        # API模式下所有商品共用同一个 web_url (列表页)
+                        yield name, web_url, not has_stock
+                
+                local_restocks, local_changed = self._process_product_batch(site_name, product_generator())
                                 
             return False, local_restocks, local_changed
             
@@ -187,116 +250,129 @@ class TobaccoWatcher:
             print(f"❌ PipeUncle API 请求失败: {e}")
             return True, [], False
 
-    def check_stock(self, card_soup, selectors):
-        """解析常规站点的单商品库存 (HTML 模式)"""
-        # 1. 获取商品名称
+    def _check_stock_html(self, card_soup, selectors):
+        """[工具] 解析 HTML 单商品库存"""
         name_elem = card_soup.select_one(selectors['product_name'])
         if not name_elem: return None, True
         
         raw_name = name_elem.get_text(strip=True)
         name = re.sub(r'<[^>]+>', '', raw_name).strip()
 
-        # 2. 获取状态区域 (按钮/文字)
         button = card_soup.select_one(selectors['status_button'])
-        if not button: return None, None # 无效区域，跳过
+        if not button: return None, None
 
-        is_sold_out = False
-        
-        # 策略 A: 优先匹配特定售罄文字 (配置 sold_out_text 时)
-        if selectors.get('sold_out_text'):
+        # 获取按钮文本 (预处理)
+        import copy
+        btn_clone = copy.copy(button)
+        for hidden in btn_clone.select('.hidden'): hidden.decompose()
+        btn_text = btn_clone.get_text(strip=True).upper()
+
+        # 策略 0: 正向匹配 (优先) - 如果配置了明确的有货关键词
+        if selectors.get('in_stock_text'):
+            target_text = selectors['in_stock_text'].upper()
+            # 默认设为售罄，只有匹配到有货关键词才算有货
+            is_sold_out = True
+            if target_text in btn_text:
+                is_sold_out = False
+
+        # 策略 A: 特定售罄文字 (反向匹配)
+        elif selectors.get('sold_out_text'):
+            is_sold_out = False # 默认有货
             target_text = selectors['sold_out_text'].upper()
-            
-            # 提取可见文本 (移除 .hidden 元素)
-            import copy
-            btn_clone = copy.copy(button)
-            for hidden in btn_clone.select('.hidden'): hidden.decompose()
-            btn_text = btn_clone.get_text(strip=True).upper()
-            
             if target_text in btn_text:
                 is_sold_out = True
         
-        # 策略 B: 通用属性检查 (未配置特定文字时)
+        # 策略 B: 通用属性 (反向匹配)
         else:
-            # B1. 检查 disabled 属性
+            is_sold_out = False # 默认有货
             if button.has_attr('disabled'): is_sold_out = True
-            
-            # B2. 检查 class 是否包含 sold-out
             if not is_sold_out:
                 classes = button.get('class', [])
                 if any('sold-out' in c for c in classes): is_sold_out = True
-            
-            # B3. 检查通用关键词
             if not is_sold_out:
                 default_keywords = ["售罄", "SOLD OUT", "SOLDOUT", "OUT OF STOCK"]
-                btn_text = button.get_text(strip=True).upper()
                 if any(kw in btn_text for kw in default_keywords):
                     is_sold_out = True
 
         return name, is_sold_out
 
-    def _scan_site(self, item):
-        """执行单个站点的扫描任务 (运行于独立线程)"""
-        # 0. 特殊处理: 茄营 (PipeUncle) API 模式
-        # 用户确认全是 API 链接，因此直接匹配 /api/ 即可
-        if "pipeuncle.com/api/" in item['url']:
-            return self._scan_api_pipeuncle(item)
-
-        # [安全策略] 随机延迟 1-3 秒，错峰请求，避免高并发触发防火墙
-        time.sleep(random.uniform(1, 3))
+    def _scan_html_site(self, item):
+        """[策略] 通用 HTML 站点扫描逻辑"""
+        time.sleep(random.uniform(0.1, 0.5))
 
         url = item['url']
         site_name, selectors = get_site_config(url)
         
         html = self.fetch_page(url)
         if not html:
-            return True, [], False  # 返回: has_error, restocks, status_changed
+            return True, [], False
 
         soup = BeautifulSoup(html, 'html.parser')
         cards = soup.select(selectors['product_card'])
         
-        local_restocks = []
-        local_changed = False
+        found_count = 0
+        def product_generator():
+            nonlocal found_count
+            for card in cards:
+                result = self._check_stock_html(card, selectors)
+                if result and result[0] is not None:
+                    name, is_sold_out = result
+                    found_count += 1
+                    yield name, url, is_sold_out
+
+        local_restocks, local_changed = self._process_product_batch(site_name, product_generator())
         
-        for card in cards:
-            # 1. 解析商品状态
-            result = self.check_stock(card, selectors)
-            if not result or result[0] is None: continue
-            
-            name, is_sold_out = result
-            product_id = f"{name}_{url}"
-            
-            # 2. 对比历史状态
-            last_record = self.stock_history.get(product_id, {})
-            was_sold_out = last_record.get('is_sold_out', True)
-            
-            if is_sold_out != was_sold_out:
-                local_changed = True
-            
-            # 3. 更新内存记录 (线程安全：不同线程处理不同 url，不会冲突)
-            self.stock_history[product_id] = {
-                'name': name, 'url': url, 'is_sold_out': is_sold_out,
-                'site_name': site_name,
-                'updated_at': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-
-            # 4. 处理补货逻辑
-            if was_sold_out and not is_sold_out:
-                # 首次运行且无历史记录时，视为初始化，静默处理
-                if self.first_run and not self.history_file_exists:
-                    print(f"✅ [初始化] 发现有货: {name} (静默)")
-                else:
-                    print(f"🔔 [补货] {name}")
-                    local_restocks.append(self.stock_history[product_id])
-            
-            # 5. 处理售罄逻辑
-            if not was_sold_out and is_sold_out:
-                print(f"❌ [售罄] {name}")
-                self._delete_alert(product_id)
-
+        if found_count == 0:
+            if len(cards) > 0:
+                print(f"⚠️ [{site_name}] 警告: 找到了 {len(cards)} 个卡片但无法提取商品信息，请检查内部选择器")
+            else:
+                print(f"⚠️ [{site_name}] 警告: 未找到任何商品卡片，请检查 product_card 选择器")
+                
         return False, local_restocks, local_changed
 
+    def _scan_site(self, item):
+        """[调度] 核心调度器：根据 URL 分发到不同的扫描策略"""
+        # 1. 策略路由
+        if "pipeuncle.com/api/" in item['url']:
+            return self._scan_api_pipeuncle(item)
+        
+        # 2. 默认策略 (HTML 通用解析)
+        return self._scan_html_site(item)
+
+    def _scan_domain_group(self, domain, items):
+        """针对特定域名的并行扫描任务"""
+        print(f"🚀 [并发] 正在扫描: {domain} ({len(items)} 任务)")
+        
+        domain_restocks = []
+        domain_error = False
+        domain_changed = False
+        
+        # 每个网站单独的类别并发 10 扫描
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(self._scan_site, item) for item in items]
+            
+            for future in as_completed(futures):
+                try:
+                    has_error, restocks, changed = future.result()
+                    if has_error: domain_error = True
+                    if changed: domain_changed = True
+                    if restocks: domain_restocks.extend(restocks)
+                except Exception as e:
+                    print(f"⚠️ {domain} 线程异常: {e}")
+                    domain_error = True
+
+        # 即时反馈
+        if domain_changed or (self.first_run and not self.history_file_exists):
+            self._refresh_dashboard()
+            
+        if domain_restocks:
+            print(f"⚡ [即时推送] {domain} 发现 {len(domain_restocks)} 个补货")
+            self._send_restock_alerts(domain_restocks)
+            
+        return domain_error, domain_changed
+
     def run(self):
-        """核心调度逻辑 (并发模式 - 按域名分批)"""
+        """核心调度逻辑 (全站同步并发)"""
         print("-" * 50)
         self.last_scan_time = datetime.datetime.now()
         
@@ -308,57 +384,34 @@ class TobaccoWatcher:
                 domain_groups[domain] = []
             domain_groups[domain].append(item)
 
-        # 确保华盛 (huashengyansi) 相关的组排在最后
-        sorted_domains = sorted(domain_groups.keys(), key=lambda d: 1 if 'huashengyansi' in d else 0)
-
-        all_new_restocks = []
+        domains = list(domain_groups.keys())
         any_error = False
-        any_status_changed = False
         
-        # 2. 按域名批次执行扫描
-        for domain in sorted_domains:
-            domain_items = domain_groups[domain]
-            domain_restocks = []
-            domain_status_changed = False
-            
-            print(f"🚀 开始扫描域名: {domain} ({len(domain_items)} 个任务)...")
-            
-            # 针对当前域名组使用线程池并发
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(self._scan_site, item) for item in domain_items]
-                
-                for future in as_completed(futures):
-                    try:
-                        has_error, restocks, changed = future.result()
-                        if has_error: any_error = True
-                        if changed: 
-                            domain_status_changed = True
-                            any_status_changed = True
-                        if restocks: 
-                            domain_restocks.extend(restocks)
-                            all_new_restocks.extend(restocks)
-                    except Exception as e:
-                        print(f"⚠️ 线程执行异常: {e}")
-                        any_error = True
+        print(f"🔄 启动全站并发扫描: {', '.join(domains)}")
 
-            # 3. [即时反馈] 如果该域名有状态变更，立即刷新看板
-            # (注意顺序：先刷新看板，再发补货通知，这样用户看到补货通知时看板已经是新的了)
-            if domain_status_changed or (self.first_run and domain == sorted_domains[0]): # 第一次运行时至少刷一次
-                 self._refresh_dashboard()
-
-            # 4. [即时反馈] 如果该域名有补货，立即发送通知，无需等待所有域名跑完
-            if domain_restocks:
-                print(f"⚡ [即时推送] {domain} 发现 {len(domain_restocks)} 个补货，立即发送通知...")
-                self._send_restock_alerts(domain_restocks)
+        # 2. 顶级并发：每个域名一个线程，同时开始
+        with ThreadPoolExecutor(max_workers=len(domains) + 1) as main_executor:
+            futures = []
+            for domain, items in domain_groups.items():
+                futures.append(main_executor.submit(self._scan_domain_group, domain, items))
+            
+            # 等待所有域名完成
+            for future in as_completed(futures):
+                try:
+                    d_error, d_changed = future.result()
+                    if d_error: any_error = True
+                except Exception as e:
+                    print(f"⚠️ 域名扫描总控异常: {e}")
+                    any_error = True
 
         self.first_run = False
             
-        # 5. 输出统计日志
-        total_items = len(self.stock_history) - 2
+        # 3. 输出统计日志
+        total_items = sum(1 for k in self.stock_history if not k.startswith('_'))
         in_stock_count = sum(1 for v in self.stock_history.values() if isinstance(v, dict) and not v.get('is_sold_out', True))
         print(f"📊 本轮统计: 总计 {total_items} 商品 | ✅ 有货: {in_stock_count} | ❌ 售罄: {total_items - in_stock_count}")
 
-        # 6. 持久化与错误处理
+        # 4. 持久化与错误处理
         self.save_history()
         self._handle_errors(any_error)
         print("-" * 50)
@@ -385,14 +438,13 @@ class TobaccoWatcher:
                 if resp: self.dashboard_message_ids.append(resp['result']['message_id'])
 
     def _generate_dashboard_content(self):
-        """生成看板内容 (按站点分组 + 分片)"""
-        if not self.stock_history: return ["⏳ 初始化中..."]
+        """生成看板内容"""
+        # 加锁读取，避免生成过程中数据变动导致不一致
+        with self.lock:
+            items = [v for k, v in self.stock_history.items() if not k.startswith('_')]
         
-        # 过滤
-        items = [v for k, v in self.stock_history.items() if not k.startswith('_')]
         if not items: return ["📭 暂无监控"]
         
-        # 分组 (按 site_name)
         grouped = {}
         for item in items:
             site = item.get('site_name', '未知')
@@ -405,24 +457,23 @@ class TobaccoWatcher:
         for site, products in grouped.items():
             products.sort(key=lambda x: x['is_sold_out'])
             
-            # 计算当前站点的库存统计
             total_count = len(products)
             in_stock = sum(1 for p in products if not p['is_sold_out'])
             out_stock = total_count - in_stock
             
             site_msgs = []
-            # 标题带上统计数据 (例如: 20有货 / 80售罄)
-            header = (
+            page_num = 1
+            
+            # 基础标题
+            base_header = (
                 f"🌐 <b>{site}</b> (更新: {datetime.datetime.now().strftime('%H:%M:%S')})\n"
-                f"📊 <b>统计:</b> ✅ {in_stock} 有货 | ❌ {out_stock} 售罄\n"
+                f"📊 <b>统计:</b> ✅ {in_stock} 有货 | ❌ {out_stock} 售罄"
             )
-            current_msg = header + "<blockquote expandable>"
+            
+            current_msg = f"{base_header}\n<blockquote expandable>"
             quote_open = True
             
             for p in products:
-                # 仅保留商品名，去掉了超链接 <a> 标签
-                # 示例: ✅ 商品名 (有货) / ❌ <s>商品名</s> (售罄)
-                # 注意：为了让 Markdown/HTML 解析正常，售罄时仍保留 <s> 删除线
                 product_name = p['name']
                 line = f"{'✅' if not p['is_sold_out'] else '❌ <s>'} {product_name}{'</s>' if p['is_sold_out'] else ''}\n"
                 
@@ -430,7 +481,8 @@ class TobaccoWatcher:
                     if quote_open: current_msg += "</blockquote>"
                     site_msgs.append(current_msg)
                     
-                    current_msg = f"🌐 <b>{site} (续)</b>\n<blockquote expandable>"
+                    page_num += 1
+                    current_msg = f"🌐 <b>{site} - {page_num}</b>\n<blockquote expandable>"
                     quote_open = True
                 
                 current_msg += line
@@ -451,13 +503,10 @@ class TobaccoWatcher:
             )
             resp = self.notifier.send_message(text)
             if resp:
-                pid = f"{item['name']}_{item['url']}"
-                self.alert_messages[pid] = resp['result']['message_id']
-
-    def _delete_alert(self, pid):
-        if pid in self.alert_messages:
-            self.notifier.delete_message(self.alert_messages[pid])
-            del self.alert_messages[pid]
+                # 使用统一 ID 生成逻辑
+                pid = self._get_product_id(item['name'], item['url'])
+                with self.lock:
+                    self.alert_messages[pid] = resp['result']['message_id']
 
     def _handle_errors(self, has_error):
         if has_error:
@@ -488,6 +537,5 @@ class TobaccoWatcher:
 
     def start_bot(self):
         """启动指令监听线程"""
-        import threading
         t = threading.Thread(target=self.notifier.poll_commands, args=(self.handle_command,), daemon=True)
         t.start()

@@ -8,10 +8,10 @@ load_dotenv()
 # 模板 1: Tobacco Lifestyle (列表页模式)
 TEMPLATE_TOBACCO = {
     "type": "list",
-    "product_card": "div.card__content",
+    "product_card": "div.product-card-wrapper", # 去掉 li 前缀，更通用
     "product_name": "h3.card__heading a",
-    "status_button": "button[name='add']",
-    "sold_out_text": "售罄"
+    "status_button": "form button[name='add']", # 稍微放宽按钮选择器
+    "in_stock_text": "添加到购物车"
 }
 
 # 模板 2: 华盛烟丝 (列表页模式)
@@ -20,7 +20,16 @@ TEMPLATE_HUASHENG = {
     "product_card": "div.product-wrapper",
     "product_name": "h3.wd-entities-title a",
     "status_button": "div.wd-add-btn a",
-    "sold_out_text": "阅读更多"
+    "in_stock_text": "加入购物车" # 正向匹配
+}
+
+# 模板 4: 花沢 (ribenyan.com)
+TEMPLATE_RIBENYAN = {
+    "type": "list",
+    "product_card": "div.d-flex.py-2.border-bottom",
+    "product_name": "div.col-sm-8 p.mb-1",
+    "status_button": "div.col-sm-4 a.btn-success", # 更精确的选择器
+    "in_stock_text": "加购物车"
 }
 
 # 模板 3: 默认通用
@@ -47,6 +56,10 @@ SITE_CONFIGS = {
     "pipeuncle.com": {
         "name": "茄营",
         "template": TEMPLATE_DEFAULT  # API 模式不使用 CSS 选择器模板
+    },
+    "ribenyan.com": {
+        "name": "花沢",
+        "template": TEMPLATE_RIBENYAN
     }
 }
 
