@@ -30,13 +30,17 @@ class TobaccoWatcher:
         self.session = self._init_session()
         self.ua = UserAgent()
         self.notifier = TelegramNotifier(self.session)
-        self.lock = threading.Lock() # 线程安全锁
+        self.lock = threading.RLock() # 线程安全锁 (改为 RLock 以支持重入)
         
         # 2. 加载持久化数据
         self.history_file_exists = os.path.exists(STATUS_FILE)
         self.watch_list = self._load_products()
         self.stock_history = self._load_history()
         
+        # 看板状态 (需在 cleanup 前初始化)
+        self.dashboard_message_ids = self.stock_history.get('_dashboard_ids', [])
+        self.alert_messages = self.stock_history.get('_alert_messages', {})
+
         # 3. 清理僵尸数据 (逻辑内存泄漏修复)
         self._cleanup_stale_data()
 
@@ -46,10 +50,6 @@ class TobaccoWatcher:
         self.consecutive_errors = 0
         self.error_alert_sent = False
         self.first_run = True
-        
-        # 看板状态
-        self.dashboard_message_ids = self.stock_history.get('_dashboard_ids', [])
-        self.alert_messages = self.stock_history.get('_alert_messages', {})
 
     def _init_session(self):
         s = requests.Session()
@@ -321,6 +321,16 @@ class TobaccoWatcher:
             is_sold_out = True
             if target_text in btn_text:
                 is_sold_out = False
+                
+                # [新增] 二次校验：即使文字匹配，如果包含特定售罄 class 也视为无货
+                # (应对 Ribenyan 这种没货也显示"加购物车"但样式为 btn-secondary 的情况)
+                if selectors.get('sold_out_class'):
+                    # class 属性通常是列表，但也可能是字符串，安全处理
+                    btn_classes = button.get('class', [])
+                    if isinstance(btn_classes, str): btn_classes = [btn_classes]
+                    
+                    if selectors['sold_out_class'] in btn_classes:
+                        is_sold_out = True
 
         # 策略 A: 特定售罄文字 (反向匹配)
         elif selectors.get('sold_out_text'):
@@ -468,24 +478,26 @@ class TobaccoWatcher:
 
     def _refresh_dashboard(self):
         """刷新看板消息"""
-        pages = self._generate_dashboard_content()
-        
-        # 多退
-        while len(self.dashboard_message_ids) > len(pages):
-            old_id = self.dashboard_message_ids.pop()
-            self.notifier.delete_message(old_id)
+        # 加锁防止多线程并发刷新导致消息重复发送
+        with self.lock:
+            pages = self._generate_dashboard_content()
             
-        # 少补 & 更新
-        for i, text in enumerate(pages):
-            if i < len(self.dashboard_message_ids):
-                msg_id = self.dashboard_message_ids[i]
-                if not self.notifier.edit_message(msg_id, text):
-                    # 编辑失败则重发
+            # 多退
+            while len(self.dashboard_message_ids) > len(pages):
+                old_id = self.dashboard_message_ids.pop()
+                self.notifier.delete_message(old_id)
+                
+            # 少补 & 更新
+            for i, text in enumerate(pages):
+                if i < len(self.dashboard_message_ids):
+                    msg_id = self.dashboard_message_ids[i]
+                    if not self.notifier.edit_message(msg_id, text):
+                        # 编辑失败则重发
+                        resp = self.notifier.send_message(text)
+                        if resp: self.dashboard_message_ids[i] = resp['result']['message_id']
+                else:
                     resp = self.notifier.send_message(text)
-                    if resp: self.dashboard_message_ids[i] = resp['result']['message_id']
-            else:
-                resp = self.notifier.send_message(text)
-                if resp: self.dashboard_message_ids.append(resp['result']['message_id'])
+                    if resp: self.dashboard_message_ids.append(resp['result']['message_id'])
 
     def _generate_dashboard_content(self):
         """生成看板内容"""

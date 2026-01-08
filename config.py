@@ -29,7 +29,8 @@ TEMPLATE_RIBENYAN = {
     "product_card": "div.d-flex.py-2.border-bottom",
     "product_name": "div.col-sm-8 p.mb-1",
     "status_button": "div.col-sm-4 a.btn", # 宽泛选择器，匹配有货(success)和无货(secondary)按钮
-    "in_stock_text": "加购物车"
+    "in_stock_text": "加购物车",
+    "sold_out_class": "btn-secondary"
 }
 
 # 模板 3: 默认通用
